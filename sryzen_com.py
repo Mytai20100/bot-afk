@@ -1,4 +1,4 @@
-#Version idk =) this host die on 23/7/2025
+#Version idk =) this host die on 23/7/2025 
 import requests, re, json, websocket, ssl, time, traceback, base64
 from datetime import datetime
 import urllib3
