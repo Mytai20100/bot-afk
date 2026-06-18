@@ -591,7 +591,7 @@ class AltareBot:
                 await self.farm_daily_loop(getattr(self, 'max_farms', 100))
                 return
             if self.daily_afk:
-                await self.claim_daily_reward(
+                await self.claim_daily_reward()
             afk_started = await self.start_afk()
             if not afk_started:
                 log("AFK start failed, trying to switch teams to fix...", "..")
@@ -610,6 +610,7 @@ class AltareBot:
                                     log("AFK session started after team switch!", "OK")
                                     afk_started = True
                                     break
+                
                 if not afk_started:
                     log("Failed to start AFK session, stopping.", "!!")
                     return
@@ -732,7 +733,7 @@ async def main():
     p = argparse.ArgumentParser(description="altare.gg Bot")
     p.add_argument("--email",    default=EMAIL,    help="altare.gg login email")
     p.add_argument("--password", default=PASSWORD, help="Password")
-    p.add_argument("-b", "--bug", action="store_true", help="⚠️  WARNING: HIGH RISK OF BAN! Enable bug/farm mode (create teams to farm daily rewards)")
+    p.add_argument("-b", "--bug", action="store_true", help="WARNING: HIGH RISK OF BAN! Enable bug/farm mode (create teams to farm daily rewards)")
     p.add_argument("-n", "--name", default="FarmTeam", help="Base name for teams in bug mode (default: FarmTeam)")
     p.add_argument("--max-farms", type=int, default=100, help="Max number of farms in bug mode (default: 100)")
     p.add_argument("-u", "--user", dest="user_handle", help="Custom wallet handle for main account (e.g., myname)")
