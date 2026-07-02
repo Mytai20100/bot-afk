@@ -4,7 +4,8 @@ from datetime import datetime
 
 EMAIL    = ""
 PASSWORD = ""
-DAILY_AFK = True 
+DAILY_AFK = True
+MULTI_AFK = True
 
 TICK_INTERVAL = 29
 BASE          = "https://altare.gg"
@@ -20,8 +21,146 @@ def log(msg, tag=".."):
 def fmt_up(s):
     s = int(s)
     return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
+
+class TeamWorker:
+    def __init__(self, bot, tenant_id, name):
+        self.bot = bot
+        self.tenant_id = tenant_id
+        self.name = name
+        self.ok = True
+        self.ticks = 0
+        self.credits = 0.0
+        self.initial_balance = 0.0
+        self.total_earned = 0.0
+        self.multiplier = 1.0
+        self.active_users = 1
+        self.fail_count = 0
+        self.last_balance_update = 0
+        self.afk_started = False
+
+    async def start_afk(self) -> bool:
+        await self.stop_afk()
+        await asyncio.sleep(1)
+        try:
+            async with self.bot.session.post(
+                f"{BASE}/api/tenants/{self.tenant_id}/rewards/afk/start",
+                json={},
+                headers=self.bot._api_hdrs(referer=f"{BASE}/billing/rewards/afk"),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status in (200, 201):
+                    log(f"[{self.name}] AFK started", "OK")
+                    return True
+                body = await r.text()
+                if "already have an AFK" in body.lower():
+                    log(f"[{self.name}] AFK already active", "..")
+                    return True
+                log(f"[{self.name}] AFK start failed [{r.status}]", "!!")
+        except Exception as e:
+            log(f"[{self.name}] Error starting AFK: {e}", "!!")
+        return False
+
+    async def stop_afk(self) -> bool:
+        try:
+            async with self.bot.session.post(
+                f"{BASE}/api/tenants/{self.tenant_id}/rewards/afk/stop",
+                json={},
+                headers=self.bot._api_hdrs(referer=f"{BASE}/billing/rewards/afk"),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status in (200, 201, 204):
+                    return True
+                body = await r.text()
+                if "No active AFK" in body:
+                    return True
+        except Exception:
+            pass
+        return True
+
+    async def update_balance(self):
+        try:
+            async with self.bot.session.get(
+                f"{BASE}/api/tenants/{self.tenant_id}/wallet",
+                headers=self.bot._api_hdrs(referer=f"{BASE}/billing/credits/transactions"),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    balance_cents = data.get("balanceCents", 0)
+                    self.credits = balance_cents / 100.0
+        except Exception:
+            pass
+
+    async def heartbeat(self) -> tuple:
+        try:
+            async with self.bot.session.post(
+                f"{BASE}/api/tenants/{self.tenant_id}/rewards/afk/heartbeat",
+                headers=self.bot._api_hdrs(referer=f"{BASE}/billing/rewards/afk"),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                status = r.status
+                try:
+                    body = await r.json()
+                except:
+                    body = await r.text()
+                return (status, body)
+        except Exception as e:
+            return (0, str(e))
+
+    async def run_loop(self):
+        self.afk_started = await self.start_afk()
+        if not self.afk_started:
+            log(f"[{self.name}] Failed to start AFK, skipping", "!!")
+            return
+        await self.update_balance()
+        self.initial_balance = self.credits
+        self.last_balance_update = time.time()
+        while self.bot.running:
+            status, body = await self.heartbeat()
+            self.ticks += 1
+            ok = status in (200, 201)
+            if ok and isinstance(body, dict):
+                self.multiplier = body.get("multiplier", self.multiplier)
+                self.active_users = body.get("activeUsers", self.active_users)
+                self.fail_count = 0
+                self.ok = True
+            elif status in (400, 404, 409):
+                self.fail_count += 1
+                if self.fail_count >= 3:
+                    log(f"[{self.name}] Too many errors, restarting AFK...", "!!")
+                    if await self.start_afk():
+                        self.fail_count = 0
+                        self.ok = True
+                    else:
+                        self.bot.running = False
+                        break
+            elif status == 419:
+                log(f"[{self.name}] Token expired", "!!")
+                if not await self.bot.login():
+                    self.bot.running = False
+                    break
+                await self.start_afk()
+            elif status == 401:
+                log(f"[{self.name}] Session expired", "!!")
+                if not await self.bot.login():
+                    self.bot.running = False
+                    break
+                await self.start_afk()
+            elif status == 429:
+                log(f"[{self.name}] Rate limited", "!!")
+                await asyncio.sleep(60)
+            self.ok = ok
+            if time.time() - self.last_balance_update >= 60:
+                await self.update_balance()
+                self.total_earned = self.credits - self.initial_balance
+                self.last_balance_update = time.time()
+            for _ in range(TICK_INTERVAL * 10):
+                if not self.bot.running:
+                    break
+                await asyncio.sleep(0.1)
+
 class AltareBot:
-    def __init__(self, email, password, bug_mode=False, team_name="FarmTeam", user_handle=None, random_suffix=False, daily_afk=False):
+    def __init__(self, email, password, bug_mode=False, team_name="FarmTeam", user_handle=None, random_suffix=False, daily_afk=False, multi_afk=False):
         self.email    = email.strip()
         self.password = password.strip()
         self.bug_mode = bug_mode
@@ -29,6 +168,7 @@ class AltareBot:
         self.user_handle = user_handle
         self.random_suffix = random_suffix
         self.daily_afk = daily_afk
+        self.multi_afk = multi_afk
         self.session  = None
         self.csrf     = ""
         self.running  = False
@@ -44,6 +184,8 @@ class AltareBot:
         self.current_team_name = "Unknown"
         self.last_balance_update = 0
         self.tenant_id = None
+        self.workers = []
+
     def _base_hdrs(self):
         return {
             "User-Agent":         UA,
@@ -52,6 +194,7 @@ class AltareBot:
             "sec-ch-ua-mobile":   "?0",
             "sec-ch-ua-platform": '"Windows"',
         }
+
     def _api_hdrs(self, referer=None):
         return {
             **self._base_hdrs(),
@@ -64,24 +207,19 @@ class AltareBot:
             "sec-fetch-site":   "same-origin",
             "priority":         "u=1, i",
         }
+
     async def login(self) -> bool:
         log("Logging in...", "..")
-        payload = {
-            "identifier": self.email,
-            "password":   self.password,
-        }
+        payload = {"identifier": self.email, "password": self.password}
         try:
             async with self.session.post(
                 f"{BASE}/api/auth/login",
                 json=payload,
                 headers={
                     **self._base_hdrs(),
-                    "Accept":         "application/json",
-                    "Content-Type":   "application/json",
-                    "Referer":        f"{BASE}/login",
-                    "sec-fetch-dest": "empty",
-                    "sec-fetch-mode": "cors",
-                    "sec-fetch-site": "same-origin",
+                    "Accept": "application/json", "Content-Type": "application/json",
+                    "Referer": f"{BASE}/login",
+                    "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin",
                 },
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as r:
@@ -101,7 +239,6 @@ class AltareBot:
                     log(f"Logged in! Token: {token[:30]}...", "OK")
                     return True
             log("Login successful but no token in response", "!!")
-            log(f"Response: {str(body)[:200]}", "!!")
             return False
         elif status == 401:
             log("Wrong email or password!", "!!")
@@ -113,41 +250,25 @@ class AltareBot:
         else:
             log(f"Login failed (status {status}): {str(body)[:200]}", "!!")
             return False
-    async def _get_tenant_id(self) -> str:
-        if self.tenant_id:
-            return self.tenant_id
+
+    async def list_teams(self) -> list:
         try:
             async with self.session.get(
                 f"{BASE}/api/tenants",
                 headers=self._api_hdrs(),
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as r:
-                if r.status != 200:
-                    return ""
-                data = await r.json()
-                if isinstance(data, dict) and "items" in data:
-                    items = data["items"]
-                    if items and len(items) > 0:
-                        self.current_team_name = items[0].get("name", "Unknown")
-                        self.tenant_id = items[0].get("id", "")
-                        return self.tenant_id
-                elif isinstance(data, list) and len(data) > 0:
-                    self.current_team_name = data[0].get("name", "Unknown")
-                    self.tenant_id = data[0].get("id", "")
-                    return self.tenant_id
-                elif isinstance(data, dict):
-                    self.current_team_name = data.get("name", "Unknown")
-                    self.tenant_id = data.get("id", "")
-                    return self.tenant_id
+                if r.status == 200:
+                    data = await r.json()
+                    if isinstance(data, dict) and "items" in data:
+                        return data["items"]
+                    elif isinstance(data, list):
+                        return data
         except Exception:
             pass
-        return ""
-    async def claim_daily_reward(self):
-        log("Claiming daily reward...", "..")
-        tenant_id = await self._get_tenant_id()
-        if not tenant_id:
-            log("Failed to get tenant_id, skipping daily reward", "!!")
-            return False
+        return []
+
+    async def claim_daily_for_team(self, tenant_id: str, team_name: str = "Team") -> bool:
         try:
             async with self.session.post(
                 f"{BASE}/api/tenants/{tenant_id}/rewards/claim",
@@ -160,19 +281,286 @@ class AltareBot:
                         reward = data.get("totalRewardCents", 0)
                         streak = data.get("newStreak", 0)
                         balance = data.get("balanceCents", 0)
-                        log(f"Daily reward claimed! +{reward} cents | Streak: {streak} | Balance: {balance}", "OK")
+                        log(f"[{team_name}] Daily reward! +{reward} cents | Streak: {streak} | Balance: {balance}", "OK")
                         return True
                 elif r.status == 400:
                     body = await r.text()
                     if "already claimed" in body.lower() or "cooldown" in body.lower():
-                        log("Daily reward already claimed today", "..")
+                        log(f"[{team_name}] Already claimed today", "..")
                     else:
-                        log(f"Daily reward error: {body[:100]}", "!!")
+                        log(f"[{team_name}] Daily error: {body[:100]}", "!!")
                 else:
-                    log(f"Daily reward failed: {r.status}", "!!")
+                    log(f"[{team_name}] Daily failed: {r.status}", "!!")
         except Exception as e:
-            log(f"Error claiming daily: {e}", "!!")
+            log(f"[{team_name}] Error claiming daily: {e}", "!!")
         return False
+
+    async def claim_daily_reward(self):
+        log("Claiming daily reward...", "..")
+        teams = await self.list_teams()
+        if not teams:
+            log("No teams found for daily reward", "!!")
+            return False
+        for t in teams:
+            tid = t.get("id", "")
+            tname = t.get("name", "Unknown")
+            if tid:
+                await self.claim_daily_for_team(tid, tname)
+                await asyncio.sleep(2)
+        return True
+
+    def _status_line_multi(self):
+        uptime = fmt_up(time.time() - self.start_time)
+        team_names = ", ".join(f"{w.name}" + ("✓" if w.ok else "✗") for w in self.workers)
+        total_ticks = sum(w.ticks for w in self.workers)
+        total_earned = sum(w.total_earned for w in self.workers)
+        total_credits = sum(w.credits for w in self.workers)
+        avg_mult = sum(w.multiplier for w in self.workers) / max(len(self.workers), 1)
+        avg_active = sum(w.active_users for w in self.workers) // max(len(self.workers), 1)
+        return (
+            f"\r[{ts()}] Teams: {team_names} | "
+            f"Uptime: {uptime} | "
+            f"Credits: {total_credits:.2f} | "
+            f"Earned: +{total_earned:.2f} | "
+            f"Multiplier: {avg_mult:.1f}x | "
+            f"Active: {avg_active} | "
+            f"Ticks: {total_ticks}"
+        )
+
+    def print_status(self, ok, status):
+        uptime = fmt_up(time.time() - self.start_time)
+        status_icon = "✓" if ok else "✗"
+        print(
+            f"\r[{ts()}] {status_icon} Team: {self.current_team_name} | "
+            f"Uptime: {uptime} | "
+            f"Credits: {self.credits:.2f} | "
+            f"Earned: +{self.total_earned:.2f} | "
+            f"Multiplier: {self.multiplier:.1f}x | "
+            f"Active: {self.active_users} | "
+            f"Ticks: {self.tick_count}",
+            end="", flush=True
+        )
+
+    async def _kb_loop(self):
+        try:
+            import termios, tty
+            fd  = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+            try:
+                while self.running:
+                    if select.select([sys.stdin], [], [], 0.1)[0]:
+                        ch = sys.stdin.read(1).lower()
+                        if ch == 'q':
+                            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                            print()
+                            log("Stopped by user.", "..")
+                            self.running = False
+                            break
+                    await asyncio.sleep(0.1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            while self.running:
+                await asyncio.sleep(1)
+
+    async def run_single(self):
+        if self.daily_afk:
+            await self.claim_daily_reward()
+
+        tenant_id = None
+        teams = await self.list_teams()
+        if teams:
+            tenant_id = teams[0].get("id", "")
+            self.current_team_name = teams[0].get("name", "Unknown")
+
+        if not tenant_id:
+            log("No teams found!", "!!")
+            return
+
+        self.tenant_id = tenant_id
+        worker = TeamWorker(self, tenant_id, self.current_team_name)
+        self.workers = [worker]
+
+        self.afk_started = await worker.start_afk()
+        if not self.afk_started:
+            log("Failed to start AFK session, stopping.", "!!")
+            return
+
+        self.running = True
+        self.start_time = time.time()
+        await worker.update_balance()
+        worker.initial_balance = worker.credits
+        worker.last_balance_update = time.time()
+
+        log(f"AFK earning started on team: {worker.name}! Press [q] to stop", "OK")
+        print()
+        kb = asyncio.create_task(self._kb_loop())
+
+        try:
+            while self.running:
+                status, body = await worker.heartbeat()
+                worker.ticks += 1
+                self.tick_count = worker.ticks
+                ok = status in (200, 201)
+
+                if time.time() - worker.last_balance_update >= 60:
+                    await worker.update_balance()
+                    worker.total_earned = worker.credits - worker.initial_balance
+                    worker.last_balance_update = time.time()
+                    self.credits = worker.credits
+                    self.total_earned = worker.total_earned
+
+                if ok and isinstance(body, dict):
+                    worker.multiplier = body.get("multiplier", worker.multiplier)
+                    worker.active_users = body.get("activeUsers", worker.active_users)
+                    worker.fail_count = 0
+                elif status in (400, 404, 409):
+                    worker.fail_count += 1
+                    if worker.fail_count >= 3:
+                        log("Too many AFK errors, restarting...", "!!")
+                        if await worker.start_afk():
+                            worker.fail_count = 0
+                        else:
+                            log("Failed to restart AFK, stopping...", "!!")
+                            self.running = False
+                            break
+                elif status == 419:
+                    log("Token expired (419)", "!!")
+                    if not await self.login():
+                        self.running = False; break
+                    await worker.start_afk()
+                elif status == 401:
+                    log("Session expired (401)", "!!")
+                    if not await self.login():
+                        self.running = False; break
+                    await worker.start_afk()
+                elif status == 429:
+                    log("Rate limited (429), waiting 60s...", "!!")
+                    await asyncio.sleep(60)
+                    continue
+                elif not ok:
+                    log(f"Heartbeat error [{status}]: {str(body)[:150]}", "!!")
+                worker.ok = ok
+                self.print_status(ok, status)
+                for _ in range(TICK_INTERVAL * 10):
+                    if not self.running: break
+                    await asyncio.sleep(0.1)
+        except KeyboardInterrupt:
+            print(); log("Ctrl+C, stopping...", "..")
+        finally:
+            self.running = False
+            if not kb.done():
+                kb.cancel()
+                try: await kb
+                except asyncio.CancelledError: pass
+            print()
+            print("=" * 55)
+            log(f"Uptime:   {fmt_up(time.time() - self.start_time)}", "OK")
+            log(f"Ticks:    {self.tick_count}", "OK")
+            log(f"Earned:   +{self.total_earned} credits", "OK")
+            log(f"Credits:  {self.credits}", "OK")
+            print("=" * 55)
+
+    async def run_multi(self):
+        teams = await self.list_teams()
+        if not teams:
+            log("No teams found!", "!!")
+            return
+
+        if self.daily_afk:
+            for t in teams:
+                tid = t.get("id", "")
+                tname = t.get("name", "Unknown")
+                if tid:
+                    await self.claim_daily_for_team(tid, tname)
+                    await asyncio.sleep(2)
+
+        for t in teams:
+            tid = t.get("id", "")
+            tname = t.get("name", "Unknown")
+            if tid:
+                self.workers.append(TeamWorker(self, tid, tname))
+
+        started = []
+        for w in self.workers:
+            if await w.start_afk():
+                started.append(w)
+            await asyncio.sleep(2)
+        self.workers = started
+
+        if not self.workers:
+            log("Failed to start any AFK session, stopping.", "!!")
+            return
+
+        self.running = True
+        self.start_time = time.time()
+
+        for w in self.workers:
+            await w.update_balance()
+            w.initial_balance = w.credits
+            w.last_balance_update = time.time()
+
+        team_list = ", ".join(w.name for w in self.workers)
+        log(f"AFK earning started on teams: {team_list}! Press [q] to stop", "OK")
+        print()
+        kb = asyncio.create_task(self._kb_loop())
+
+        tasks = [asyncio.create_task(w.run_loop()) for w in self.workers]
+
+        try:
+            display_tick = 0
+            while self.running:
+                display_tick += 1
+                if display_tick >= 3:
+                    print(self._status_line_multi(), end="", flush=True)
+                    display_tick = 0
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            print(); log("Ctrl+C, stopping...", "..")
+        finally:
+            self.running = False
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+                    try: await t
+                    except asyncio.CancelledError: pass
+            if not kb.done():
+                kb.cancel()
+                try: await kb
+                except asyncio.CancelledError: pass
+            for w in self.workers:
+                await w.stop_afk()
+                await asyncio.sleep(1)
+            total_ticks = sum(w.ticks for w in self.workers)
+            total_earned = sum(w.total_earned for w in self.workers)
+            total_credits = sum(w.credits for w in self.workers)
+            print()
+            print("=" * 55)
+            log(f"Uptime:   {fmt_up(time.time() - self.start_time)}", "OK")
+            log(f"Ticks:    {total_ticks}", "OK")
+            log(f"Earned:   +{total_earned} credits", "OK")
+            log(f"Credits:  {total_credits}", "OK")
+            print("=" * 55)
+
+    async def run(self):
+        jar = aiohttp.CookieJar(unsafe=True)
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=True),
+            cookie_jar=jar,
+        ) as sess:
+            self.session = sess
+            if not await self.login():
+                log("Login failed, stopping.", "!!")
+                return
+            if self.bug_mode:
+                await self.farm_daily_loop(getattr(self, 'max_farms', 100))
+                return
+            if self.multi_afk:
+                await self.run_multi()
+            else:
+                await self.run_single()
+
     async def create_team(self, name: str) -> str:
         rand_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
         team_name = f"{name}_{rand_suffix}"
@@ -196,59 +584,22 @@ class AltareBot:
         except Exception as e:
             log(f"Error creating team: {e}", "!!")
         return ""
-    async def switch_team(self, tenant_id: str) -> bool:
-        log(f"Switching to team: {tenant_id[:20]}...", "..")
-        try:
-            async with self.session.post(
-                f"{BASE}/api/user/switch-tenant",
-                json={"tenantId": tenant_id},
-                headers=self._api_hdrs(),
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status == 200:
-                    log("Team switched", "OK")
-                    return True
-                else:
-                    log(f"Switch failed: {r.status}", "!!")
-        except Exception as e:
-            log(f"Error switching team: {e}", "!!")
-        return False
-    async def enable_payments(self, tenant_id: str) -> bool:
-        log("Enabling payments for team...", "..")
-        try:
-            async with self.session.put(
-                f"{BASE}/api/tenants/{tenant_id}",
-                json={"paymentsEnabled": True},
-                headers=self._api_hdrs(),
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status in (200, 204):
-                    log("Payments enabled", "OK")
-                    return True
-                else:
-                    body = await r.text()
-                    log(f"Enable payments failed [{r.status}]: {body[:100]}", "!!")
-        except Exception as e:
-            log(f"Error enabling payments: {e}", "!!")
-        return False
+
     async def delete_team(self, tenant_id: str) -> bool:
         log(f"Deleting team: {tenant_id[:20]}...", "..")
-        if hasattr(self, 'original_tenant_id') and self.original_tenant_id and tenant_id != self.original_tenant_id:
+        if self.original_tenant_id and tenant_id != self.original_tenant_id:
             try:
                 teams = await self.list_teams()
-                team_to_delete = None
                 for t in teams:
                     if t.get("id") == tenant_id:
-                        team_to_delete = t
+                        balance = t.get("creditsCents", 0)
+                        if balance > 0:
+                            log(f"  Transferring {balance} cents to main...", "..")
+                            await self.transfer_credits(tenant_id, self.original_tenant_id, balance)
+                            await asyncio.sleep(2)
                         break
-                if team_to_delete:
-                    balance = team_to_delete.get("creditsCents", 0)
-                    if balance > 0:
-                        log(f"  Transferring {balance} cents to main account first...", "..")
-                        await self.transfer_credits(tenant_id, self.original_tenant_id, balance)
-                        await asyncio.sleep(2)
             except Exception as e:
-                log(f"  Error transferring before delete: {e}", "!!")
+                log(f"  Error transferring: {e}", "!!")
         try:
             async with self.session.delete(
                 f"{BASE}/api/tenants/{tenant_id}",
@@ -264,69 +615,8 @@ class AltareBot:
         except Exception as e:
             log(f"Error deleting team: {e}", "!!")
         return False
-    async def list_teams(self) -> list:
-        try:
-            async with self.session.get(
-                f"{BASE}/api/tenants",
-                headers=self._api_hdrs(),
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    if isinstance(data, dict) and "items" in data:
-                        return data["items"]
-                    elif isinstance(data, list):
-                        return data
-        except Exception as e:
-            log(f"Error listing teams: {e}", "!!")
-        return []
-    async def claim_daily_for_team(self, tenant_id: str, team_name: str = "Team") -> bool:
-        log(f"Claiming daily for {team_name}...", "..")
-        try:
-            async with self.session.post(
-                f"{BASE}/api/tenants/{tenant_id}/rewards/claim",
-                headers=self._api_hdrs(),
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    if data.get("ok"):
-                        reward = data.get("totalRewardCents", 0)
-                        streak = data.get("newStreak", 0)
-                        balance = data.get("balanceCents", 0)
-                        log(f"Daily claimed for {team_name}! +{reward} cents | Streak: {streak} | Balance: {balance}", "OK")
-                        return True
-                elif r.status == 400:
-                    body = await r.text()
-                    if "already claimed" in body.lower() or "cooldown" in body.lower():
-                        log(f"{team_name}: Already claimed today", "..")
-                    else:
-                        log(f"{team_name}: Daily error: {body[:100]}", "!!")
-                else:
-                    log(f"{team_name}: Daily failed: {r.status}", "!!")
-        except Exception as e:
-            log(f"{team_name}: Error claiming daily: {e}", "!!")
-        return False
-    async def set_team_handle(self, tenant_id: str, handle: str) -> bool:
-        log(f"Setting handle '{handle}' for team...", "..")
-        try:
-            async with self.session.put(
-                f"{BASE}/api/tenants/{tenant_id}",
-                json={"handle": handle},
-                headers=self._api_hdrs(),
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status in (200, 204):
-                    log("Handle set", "OK")
-                    return True
-                else:
-                    body = await r.text()
-                    log(f"Set handle failed [{r.status}]: {body[:100]}", "!!")
-        except Exception as e:
-            log(f"Error setting handle: {e}", "!!")
-        return False
+
     async def get_wallet_info(self, tenant_id: str) -> dict:
-        """Get wallet information including balance and handle"""
         try:
             async with self.session.get(
                 f"{BASE}/api/tenants/{tenant_id}/wallet",
@@ -336,11 +626,10 @@ class AltareBot:
                 if r.status == 200:
                     return await r.json()
         except Exception as e:
-            log(f"Error getting wallet info: {e}", "!!")
+            log(f"Error getting wallet: {e}", "!!")
         return {}
-    
+
     async def update_wallet_settings(self, tenant_id: str, handle: str, payments_enabled: bool = True) -> bool:
-        log(f"Setting wallet handle '{handle}'...", "..")
         try:
             async with self.session.patch(
                 f"{BASE}/api/tenants/{tenant_id}/wallet/settings",
@@ -349,17 +638,12 @@ class AltareBot:
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as r:
                 if r.status in (200, 204):
-                    log("Wallet handle set", "OK")
                     return True
-                else:
-                    body = await r.text()
-                    log(f"Set wallet handle failed [{r.status}]: {body[:100]}", "!!")
-        except Exception as e:
-            log(f"Error setting wallet handle: {e}", "!!")
+        except Exception:
+            pass
         return False
-    
+
     async def transfer_credits_by_handle(self, from_tenant: str, to_handle: str, amount_cents: int) -> bool:
-        log(f"Transferring {amount_cents} cents to @{to_handle}...", "..")
         try:
             async with self.session.post(
                 f"{BASE}/api/tenants/{from_tenant}/wallet/transfer",
@@ -376,9 +660,8 @@ class AltareBot:
         except Exception as e:
             log(f"Error transferring: {e}", "!!")
         return False
-    
+
     async def transfer_credits(self, from_tenant: str, to_tenant: str, amount_cents: int) -> bool:
-        log(f"Transferring {amount_cents} cents...", "..")
         try:
             async with self.session.post(
                 f"{BASE}/api/tenants/{from_tenant}/credits/transfer",
@@ -395,9 +678,9 @@ class AltareBot:
         except Exception as e:
             log(f"Error transferring: {e}", "!!")
         return False
+
     async def farm_daily_loop(self, max_farms=100):
         log(f"Starting farm loop (max {max_farms} cycles)...", "OK")
-        log("", "..")
         teams = await self.list_teams()
         if len(teams) == 0:
             log("No teams found!", "!!")
@@ -418,7 +701,6 @@ class AltareBot:
             else:
                 main_handle = self.user_handle
         else:
-            # Default: main_xxxx
             main_handle = f"main_{random.randint(1000, 9999)}"
         log(f"Setting main wallet handle: @{main_handle}", "..")
         await self.update_wallet_settings(self.original_tenant_id, main_handle)
@@ -429,7 +711,6 @@ class AltareBot:
             log(f"\n{'='*60}", ">>")
             log(f"CYCLE #{cycle + 1}/{max_farms}", ">>")
             log(f"{'='*60}\n", ">>")
-            log("Cleaning up empty teams...", "..")
             teams = await self.list_teams()
             for team in teams:
                 team_id = team.get("id")
@@ -466,7 +747,7 @@ class AltareBot:
             await asyncio.sleep(1)
             claimed = await self.claim_daily_for_team(new_team_id, f"Farm-{cycle+1}")
             if claimed:
-                reward_amount = 7500  # 75 coin
+                reward_amount = 7500
                 total_earned += reward_amount
                 successful_cycles += 1
                 log(f"\n✓ Cycle {cycle+1} complete. Earned: +75 cents", "OK")
@@ -493,277 +774,29 @@ class AltareBot:
         log(f"Total earned: {total_earned} cents = {total_earned/100:.2f} credits", "OK")
         log(f"All credits transferred to main account: {original_name}", "OK")
         log(f"{'='*60}", "OK")
-    
-    async def stop_afk(self) -> bool:
-        """Stop any active AFK session"""
-        tenant_id = await self._get_tenant_id()
-        if not tenant_id:
-            return False
-        try:
-            async with self.session.post(
-                f"{BASE}/api/tenants/{tenant_id}/rewards/afk/stop",
-                json={},
-                headers=self._api_hdrs(referer=f"{BASE}/billing/rewards/afk"),
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status in (200, 201, 204):
-                    log("Existing AFK session stopped", "OK")
-                    return True
-                body = await r.text()
-                if "No active AFK" in body:
-                    return True
-                return False
-        except Exception:
-            return False
 
-    async def start_afk(self) -> bool:
-        """Start AFK session"""
-        tenant_id = await self._get_tenant_id()
-        if not tenant_id:
-            log("Failed to get tenant_id for AFK start", "!!")
-            return False
-        
-        await self.stop_afk()
-        await asyncio.sleep(1)
-        
-        log("Starting AFK session...", "..")
-        try:
-            async with self.session.post(
-                f"{BASE}/api/tenants/{tenant_id}/rewards/afk/start",
-                json={},
-                headers=self._api_hdrs(referer=f"{BASE}/billing/rewards/afk"),
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status in (200, 201):
-                    log("AFK session started", "OK")
-                    return True
-                body = await r.text()
-                if "already have an AFK" in body.lower():
-                    log("AFK session already active", "..")
-                    return True
-                log(f"AFK start failed [{r.status}]: {body[:100]}", "!!")
-        except Exception as e:
-            log(f"Error starting AFK: {e}", "!!")
-        return False
-    
-    
-    async def update_balance(self):
-        """Update balance from wallet API"""
-        tenant_id = await self._get_tenant_id()
-        if not tenant_id:
-            return
-        
-        wallet_info = await self.get_wallet_info(tenant_id)
-        if wallet_info:
-            balance_cents = wallet_info.get("balanceCents", 0)
-            self.credits = balance_cents / 100.0
-    
-    async def afk_heartbeat(self) -> tuple:
-        """Send AFK heartbeat"""
-        tenant_id = await self._get_tenant_id()
-        if not tenant_id:
-            return (0, "No tenant_id")
-        
-        try:
-            async with self.session.post(
-                f"{BASE}/api/tenants/{tenant_id}/rewards/afk/heartbeat",
-                headers=self._api_hdrs(referer=f"{BASE}/billing/rewards/afk"),
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                status = r.status
-                try:
-                    body = await r.json()
-                except:
-                    body = await r.text()
-                return (status, body)
-        except Exception as e:
-            return (0, str(e))
-    
-    async def idle_tick(self):
-        tenant_id = await self._get_tenant_id()
-        if not tenant_id:
-            return (0, "No tenant_id")
-        try:
-            async with self.session.post(
-                f"{BASE}/api/tenants/{tenant_id}/idle/tick",
-                headers=self._api_hdrs(),
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                status = r.status
-                try:
-                    body = await r.json()
-                except:
-                    body = await r.text()
-                return (status, body)
-        except Exception as e:
-            return (0, str(e))
-    def print_status(self, ok, status):
-        uptime = fmt_up(time.time() - self.start_time)
-        status_icon = "✓" if ok else "✗"
-        print(
-            f"\r[{ts()}] {status_icon} Team: {self.current_team_name} | "
-            f"Uptime: {uptime} | "
-            f"Credits: {self.credits:.2f} | "
-            f"Earned: +{self.total_earned:.2f} | "
-            f"Multiplier: {self.multiplier:.1f}x | "
-            f"Active: {self.active_users} | "
-            f"Ticks: {self.tick_count}",
-            end="", flush=True
-        )
-    async def run(self):
-        jar = aiohttp.CookieJar(unsafe=True)
-        async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=True),
-            cookie_jar=jar,
-        ) as sess:
-            self.session = sess
-            if not await self.login():
-                log("Login failed, stopping.", "!!")
-                return
-            if self.bug_mode:
-                await self.farm_daily_loop(getattr(self, 'max_farms', 100))
-                return
-            
-            # Normal mode: claim daily reward once if enabled
-            if self.daily_afk:
-                await self.claim_daily_reward()
-            
-            # Start AFK session
-            afk_started = await self.start_afk()
-            if not afk_started:
-                log("Failed to start AFK session, stopping.", "!!")
-                return
-            
-            self.afk_started = True
-            self.running    = True
-            self.start_time = time.time()
-            
-            # Get initial balance
-            await self.update_balance()
-            initial_balance = self.credits
-            self.last_balance_update = time.time()
-            
-            log(f"AFK earning started on team: {self.current_team_name}! Press [q] to stop", "OK")
-            print()
-            kb = asyncio.create_task(self._kb_loop())
-            consecutive_fail = 0
-            afk_fail_count = 0
-            try:
-                while self.running:
-                    status, body = await self.afk_heartbeat()
-                    self.tick_count += 1
-                    ok = status in (200, 201)
-                    
-                    # Update balance from wallet every 60 seconds
-                    if time.time() - self.last_balance_update >= 60:
-                        await self.update_balance()
-                        self.total_earned = self.credits - initial_balance
-                        self.last_balance_update = time.time()
-                    
-                    if ok and isinstance(body, dict):
-                        self.multiplier   = body.get("multiplier",  self.multiplier)
-                        self.active_users = body.get("activeUsers", self.active_users)
-                        consecutive_fail  = 0
-                        afk_fail_count = 0
-                    elif status in (400, 404, 409):
-                        afk_fail_count += 1
-                        log(f"AFK error [{status}], attempt {afk_fail_count}", "!!")
-                        
-                        if afk_fail_count >= 3:
-                            log("Too many AFK errors, trying to restart AFK...", "!!")
-                            if await self.start_afk():
-                                afk_fail_count = 0
-                                log("AFK session restarted", "OK")
-                            else:
-                                log("Failed to restart AFK, stopping...", "!!")
-                                self.running = False
-                                break
-                    elif status == 419:
-                        consecutive_fail += 1
-                        log(f"Token expired (419), attempt {consecutive_fail}", "!!")
-                        if consecutive_fail >= 3:
-                            log("Re-logging in...", "..")
-                            if not await self.login():
-                                self.running = False; break
-                            # Restart AFK session after re-login
-                            await self.start_afk()
-                            consecutive_fail = 0
-                    elif status == 401:
-                        log("Session expired (401), re-logging in...", "!!")
-                        if not await self.login():
-                            self.running = False; break
-                        # Restart AFK session after re-login
-                        await self.start_afk()
-                        consecutive_fail = 0
-                    elif status == 429:
-                        log("Rate limited (429), waiting 60s...", "!!")
-                        await asyncio.sleep(60)
-                        continue
-                    elif not ok:
-                        log(f"Heartbeat error [{status}]: {str(body)[:150]}", "!!")
-                    self.print_status(ok, status)
-                    for _ in range(TICK_INTERVAL * 10):
-                        if not self.running: break
-                        await asyncio.sleep(0.1)
-            except KeyboardInterrupt:
-                print()
-                log("Ctrl+C, stopping...", "..")
-            finally:
-                self.running = False
-                if not kb.done():
-                    kb.cancel()
-                    try: await kb
-                    except asyncio.CancelledError: pass
-                print()
-                print("=" * 55)
-                log(f"Uptime:   {fmt_up(time.time() - self.start_time)}", "OK")
-                log(f"Ticks:    {self.tick_count}", "OK")
-                log(f"Earned:   +{self.total_earned} credits", "OK")
-                log(f"Credits:  {self.credits}", "OK")
-                print("=" * 55)
-    async def _kb_loop(self):
-        try:
-            import termios, tty
-            fd  = sys.stdin.fileno()
-            old = termios.tcgetattr(fd)
-            tty.setcbreak(fd)
-            try:
-                while self.running:
-                    if select.select([sys.stdin], [], [], 0.1)[0]:
-                        ch = sys.stdin.read(1).lower()
-                        if ch == 'q':
-                            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-                            print()
-                            log("Stopped by user.", "..")
-                            self.running = False
-                            break
-                    await asyncio.sleep(0.1)
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        except Exception:
-            while self.running:
-                await asyncio.sleep(1)
 async def main():
     p = argparse.ArgumentParser(description="altare.gg Bot")
     p.add_argument("--email",    default=EMAIL,    help="altare.gg login email")
     p.add_argument("--password", default=PASSWORD, help="Password")
-    p.add_argument("-b", "--bug", action="store_true", help="WARNING: HIGH RISK OF BAN! Enable bug/farm mode (create teams to farm daily rewards)")
-    p.add_argument("-n", "--name", default="FarmTeam", help="Base name for teams in bug mode (default: FarmTeam)")
-    p.add_argument("--max-farms", type=int, default=100, help="Max number of farms in bug mode (default: 100)")
-    p.add_argument("-u", "--user", dest="user_handle", help="Custom wallet handle for main account (e.g., myname)")
-    p.add_argument("-r", "--random", action="store_true", help="Add random suffix to user handle (e.g., myname_1234)")
-    p.add_argument("--daily-afk", action="store_true", default=DAILY_AFK, help="Auto claim daily reward when starting AFK mode")
+    p.add_argument("-b", "--bug", action="store_true", help="WARNING: HIGH RISK OF BAN! Enable bug/farm mode")
+    p.add_argument("-n", "--name", default="FarmTeam", help="Base name for teams in bug mode")
+    p.add_argument("--max-farms", type=int, default=100, help="Max number of farms in bug mode")
+    p.add_argument("-u", "--user", dest="user_handle", help="Custom wallet handle")
+    p.add_argument("-r", "--random", action="store_true", help="Add random suffix to user handle")
+    p.add_argument("--daily-afk", action="store_true", default=DAILY_AFK, help="Auto claim daily reward")
+    p.add_argument("-m", "--multi", action="store_true", default=MULTI_AFK, help="Multi-team AFK mode (all teams)")
     a = p.parse_args()
     if not a.email or not a.password:
         p.print_help()
         print("\n[!!] --email and --password are required\n")
         return
-    bot = AltareBot(a.email, a.password, bug_mode=a.bug, team_name=a.name, 
-                    user_handle=a.user_handle, random_suffix=a.random, daily_afk=a.daily_afk)
+    bot = AltareBot(a.email, a.password, bug_mode=a.bug, team_name=a.name,
+                    user_handle=a.user_handle, random_suffix=a.random, daily_afk=a.daily_afk, multi_afk=a.multi)
     if a.bug:
-        # In bug mode, we need to pass max_farms to the bot
         bot.max_farms = a.max_farms
     await bot.run()
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
