@@ -4,7 +4,7 @@ from datetime import datetime
 
 EMAIL    = ""
 PASSWORD = ""
-DAILY_AFK = False
+DAILY_AFK = True 
 
 TICK_INTERVAL = 29
 BASE          = "https://altare.gg"
@@ -43,6 +43,7 @@ class AltareBot:
         self.afk_started = False
         self.current_team_name = "Unknown"
         self.last_balance_update = 0
+        self.tenant_id = None
     def _base_hdrs(self):
         return {
             "User-Agent":         UA,
@@ -113,6 +114,8 @@ class AltareBot:
             log(f"Login failed (status {status}): {str(body)[:200]}", "!!")
             return False
     async def _get_tenant_id(self) -> str:
+        if self.tenant_id:
+            return self.tenant_id
         try:
             async with self.session.get(
                 f"{BASE}/api/tenants",
@@ -126,13 +129,16 @@ class AltareBot:
                     items = data["items"]
                     if items and len(items) > 0:
                         self.current_team_name = items[0].get("name", "Unknown")
-                        return items[0].get("id", "")
+                        self.tenant_id = items[0].get("id", "")
+                        return self.tenant_id
                 elif isinstance(data, list) and len(data) > 0:
                     self.current_team_name = data[0].get("name", "Unknown")
-                    return data[0].get("id", "")
+                    self.tenant_id = data[0].get("id", "")
+                    return self.tenant_id
                 elif isinstance(data, dict):
                     self.current_team_name = data.get("name", "Unknown")
-                    return data.get("id", "")
+                    self.tenant_id = data.get("id", "")
+                    return self.tenant_id
         except Exception:
             pass
         return ""
@@ -488,12 +494,37 @@ class AltareBot:
         log(f"All credits transferred to main account: {original_name}", "OK")
         log(f"{'='*60}", "OK")
     
+    async def stop_afk(self) -> bool:
+        """Stop any active AFK session"""
+        tenant_id = await self._get_tenant_id()
+        if not tenant_id:
+            return False
+        try:
+            async with self.session.post(
+                f"{BASE}/api/tenants/{tenant_id}/rewards/afk/stop",
+                json={},
+                headers=self._api_hdrs(referer=f"{BASE}/billing/rewards/afk"),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status in (200, 201, 204):
+                    log("Existing AFK session stopped", "OK")
+                    return True
+                body = await r.text()
+                if "No active AFK" in body:
+                    return True
+                return False
+        except Exception:
+            return False
+
     async def start_afk(self) -> bool:
         """Start AFK session"""
         tenant_id = await self._get_tenant_id()
         if not tenant_id:
             log("Failed to get tenant_id for AFK start", "!!")
             return False
+        
+        await self.stop_afk()
+        await asyncio.sleep(1)
         
         log("Starting AFK session...", "..")
         try:
@@ -506,9 +537,11 @@ class AltareBot:
                 if r.status in (200, 201):
                     log("AFK session started", "OK")
                     return True
-                else:
-                    body = await r.text()
-                    log(f"AFK start failed [{r.status}]: {body[:100]}", "!!")
+                body = await r.text()
+                if "already have an AFK" in body.lower():
+                    log("AFK session already active", "..")
+                    return True
+                log(f"AFK start failed [{r.status}]: {body[:100]}", "!!")
         except Exception as e:
             log(f"Error starting AFK: {e}", "!!")
         return False
@@ -590,37 +623,26 @@ class AltareBot:
             if self.bug_mode:
                 await self.farm_daily_loop(getattr(self, 'max_farms', 100))
                 return
+            
+            # Normal mode: claim daily reward once if enabled
             if self.daily_afk:
                 await self.claim_daily_reward()
+            
+            # Start AFK session
             afk_started = await self.start_afk()
             if not afk_started:
-                log("AFK start failed, trying to switch teams to fix...", "..")
-                current_tenant_id = await self._get_tenant_id()
-                teams = await self.list_teams()
-                for team in teams:
-                    team_id = team.get("id")
-                    if team_id != current_tenant_id:
-                        log(f"Switching to team: {team.get('name', 'Unknown')}", "..")
-                        if await self.switch_team(team_id):
-                            await asyncio.sleep(2)
-                            log(f"Switching back to original team...", "..")
-                            if await self.switch_team(current_tenant_id):
-                                await asyncio.sleep(2)
-                                if await self.start_afk():
-                                    log("AFK session started after team switch!", "OK")
-                                    afk_started = True
-                                    break
-                
-                if not afk_started:
-                    log("Failed to start AFK session, stopping.", "!!")
-                    return
+                log("Failed to start AFK session, stopping.", "!!")
+                return
             
             self.afk_started = True
             self.running    = True
             self.start_time = time.time()
+            
+            # Get initial balance
             await self.update_balance()
             initial_balance = self.credits
             self.last_balance_update = time.time()
+            
             log(f"AFK earning started on team: {self.current_team_name}! Press [q] to stop", "OK")
             print()
             kb = asyncio.create_task(self._kb_loop())
@@ -631,6 +653,8 @@ class AltareBot:
                     status, body = await self.afk_heartbeat()
                     self.tick_count += 1
                     ok = status in (200, 201)
+                    
+                    # Update balance from wallet every 60 seconds
                     if time.time() - self.last_balance_update >= 60:
                         await self.update_balance()
                         self.total_earned = self.credits - initial_balance
@@ -641,29 +665,17 @@ class AltareBot:
                         self.active_users = body.get("activeUsers", self.active_users)
                         consecutive_fail  = 0
                         afk_fail_count = 0
-                    elif status == 404 or status == 400:
+                    elif status in (400, 404, 409):
                         afk_fail_count += 1
                         log(f"AFK error [{status}], attempt {afk_fail_count}", "!!")
                         
                         if afk_fail_count >= 3:
-                            log("Too many AFK errors, trying to switch team...", "!!")
-                            teams = await self.list_teams()
-                            current_tenant_id = await self._get_tenant_id()
-                            switched = False
-                            for team in teams:
-                                team_id = team.get("id")
-                                if team_id != current_tenant_id:
-                                    log(f"Switching to team: {team.get('name', 'Unknown')}", "..")
-                                    if await self.switch_team(team_id):
-                                        await asyncio.sleep(2)
-                                        if await self.start_afk():
-                                            switched = True
-                                            afk_fail_count = 0
-                                            log(f"Switched to team: {self.current_team_name}", "OK")
-                                            break
-                            
-                            if not switched:
-                                log("No available team to switch to, stopping...", "!!")
+                            log("Too many AFK errors, trying to restart AFK...", "!!")
+                            if await self.start_afk():
+                                afk_fail_count = 0
+                                log("AFK session restarted", "OK")
+                            else:
+                                log("Failed to restart AFK, stopping...", "!!")
                                 self.running = False
                                 break
                     elif status == 419:
@@ -673,12 +685,14 @@ class AltareBot:
                             log("Re-logging in...", "..")
                             if not await self.login():
                                 self.running = False; break
+                            # Restart AFK session after re-login
                             await self.start_afk()
                             consecutive_fail = 0
                     elif status == 401:
                         log("Session expired (401), re-logging in...", "!!")
                         if not await self.login():
                             self.running = False; break
+                        # Restart AFK session after re-login
                         await self.start_afk()
                         consecutive_fail = 0
                     elif status == 429:
@@ -747,6 +761,7 @@ async def main():
     bot = AltareBot(a.email, a.password, bug_mode=a.bug, team_name=a.name, 
                     user_handle=a.user_handle, random_suffix=a.random, daily_afk=a.daily_afk)
     if a.bug:
+        # In bug mode, we need to pass max_farms to the bot
         bot.max_farms = a.max_farms
     await bot.run()
 if __name__ == "__main__":
